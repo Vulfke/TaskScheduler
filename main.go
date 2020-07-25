@@ -1,10 +1,16 @@
 package main
 
 import (
+	"bufio"
+	"encoding/json"
 	"fmt"
+	"io/ioutil"
+	"log"
 	"net/http"
 	"os"
+	"os/exec"
 	"strconv"
+	"strings"
 	"syscall"
 )
 
@@ -31,9 +37,6 @@ func (config GeneralTaskConfig) Set(field, value string) {
 
 type TaskSchedulerConfig = GeneralTaskConfig
 
-// logininfo:token:1119993912:AAGVQxcJZ-4zc2qpKqQn-Nwrlkk51Yys3UA
-// webhook: https://api.telegram.org/bot1119993912:AAGVQxcJZ-4zc2qpKqQn-Nwrlkk51Yys3UA/getUpdates
-
 type Message struct {
 	chatId int
 	text   string
@@ -42,17 +45,6 @@ type Message struct {
 func (msg Message) ToJson() string {
 
 	return fmt.Sprintf("?chat_id=%d&text=%s", msg.chatId, msg.text)
-}
-
-type LoginInfo struct {
-	chatId int32
-	token  string
-}
-
-func NewLoginInfo(config GeneralTaskConfig) LoginInfo {
-	return LoginInfo{
-		token: config["token"],
-	}
 }
 
 type TelegramApi interface {
@@ -108,11 +100,12 @@ func (api TelegramApiImpl) SendMessage(msg Message) {
 		return
 	}
 	defer res.Body.Close()
-	fmt.Print(res)
+	fmt.Println(res)
 }
 
 type Task interface {
 	Done() bool
+	Message() string
 }
 
 type ExtendedTask interface {
@@ -121,13 +114,15 @@ type ExtendedTask interface {
 }
 
 type ProcessEndedTask struct {
-	pid   ProcessId
-	pname ProcessName
+	pid     ProcessId
+	pname   ProcessName
+	message string
 }
 
 func NewProcessEndedTask(config GeneralTaskConfig) ProcessEndedTask {
 	var pid ProcessId = 0
 	pname := "unknown"
+	message := "build is ended"
 
 	if val, ok := config.Get("pid"); ok {
 		tpid, _ := strconv.Atoi(val)
@@ -138,33 +133,71 @@ func NewProcessEndedTask(config GeneralTaskConfig) ProcessEndedTask {
 		pname = val
 	}
 
+	if val, ok := config.Get("message"); ok {
+		message = val
+	}
+
 	return ProcessEndedTask{
 		pid,
 		pname,
+		message,
 	}
 }
 
 func (t ProcessEndedTask) Done() bool {
 
-	process, err := os.FindProcess(t.pid)
-	if err != nil {
-		// here I need reference on callback or maybe i don't
+	windows := true
+	linux := false
+
+	if windows {
+
+		out, err := exec.Command("tasklist", "/FI", "PID eq "+strconv.Itoa(t.pid)).Output()
+		fmt.Println(string(out), "  ", fmt.Sprintf("\" PID eq %d\"", t.pid))
+		// return true
+		if err != nil {
+			log.Println("Windows, exec.Process() Error \r\n", err)
+		}
+
+		if strings.Contains(string(out), "No tasks are running") {
+			return true
+		}
 		return false
 	}
 
-	err = process.Signal(syscall.Signal(0))
+	if linux {
 
-	if err == nil {
-		return true
+		process, err := os.FindProcess(t.pid)
+		if err != nil {
+			fmt.Println("FindProcessError\r\n", err)
+			return true
+		}
+
+		err = process.Signal(syscall.Signal(0))
+
+		fmt.Println("Process.Signal Error\r\n", err)
+
+		if err != nil {
+			return true
+		}
+
+		return false
 	}
 
-	return false
+	return true
+}
+
+func (t ProcessEndedTask) Message() string {
+	return t.message
 }
 
 type UnknownTask struct{}
 
 func (task UnknownTask) Done() bool {
 	return true
+}
+
+func (task UnknownTask) Message() string {
+	return "There wasn't any real task actually"
 }
 
 func NewUnknownTask() UnknownTask {
@@ -218,33 +251,168 @@ func NewTaskScheduler(config TaskSchedulerConfig) TaskScheduler {
 func (scheduler TaskScheduler) StartTask(config GeneralTaskConfig) {
 	task := scheduler.mTaskFabric.Create(config)
 	fmt.Println(task, task.Done())
-	cnt := 0
-	mod := 1000
-	fmt.Println("task.Done() ", task.Done())
-	for !task.Done() {
-		if cnt%mod == 0 {
-			fmt.Print(fmt.Sprintf("it is %d iteration", cnt))
+	go func(task Task) {
+		cnt := 0
+		mod := 1000
+		fmt.Println("task.Done() ", task.Done())
+		for !task.Done() {
+			if cnt%mod == 0 {
+				fmt.Print(fmt.Sprintf("it is %d iteration", cnt))
+			}
+			cnt += 1
 		}
+
+		scheduler.api.SendMessage(Message{
+			chatId: scheduler.api.ChatId(),
+			text:   task.Message(),
+		})
+	}(task)
+}
+
+/*
+So I need to create some kind of command processor, and maybe some task parser however
+
+We are talking about command line interface.
+So command processor, I suppose there should be some commands
+addtask jsonfile returns taskid
+stoptask taskid returns true/false
+addtasks jsonfile returns array of taskids.
+well that's all I suppose.
+Also there should be some interface for telegram
+But to be honest That quite far away.
+
+JsonParser Probably that is some kind of unmarshaler or anything. Also I need to get map of strings. But I could use real dtos.
+*/
+
+type Command struct {
+}
+
+type LoginInfo struct {
+	Token  string `json: token`
+	ChatID string `json: chatId`
+}
+
+type TaskDescription struct {
+	TaskType     string    `json: taskType`
+	Timeout      int       `json: timeout`
+	AfterMessage string    `json: message`
+	Command      Command   `json: command`
+	ProcessID    ProcessId `json: processId`
+}
+
+type CommandProcessor struct {
+	taskScheduler TaskScheduler
+}
+
+func (cp CommandProcessor) Process(sentense []byte) {
+	row := strings.Trim(string(sentense), " \r\n")
+	tokens := strings.Split(row, " ")
+	command := tokens[0]
+
+	switch command {
+	case "addTask":
+		cp.processAddTask(tokens)
+	case "finishTask":
+		cp.processFinishTask(tokens)
+	case "exit":
+		cp.exit()
+	}
+}
+
+func (cp CommandProcessor) processAddTask(tokens []string) {
+	taskConfigFilePath := tokens[1]
+
+	fmt.Println("tokens:", tokens)
+
+	wd, _ := os.Getwd()
+	fmt.Println(taskConfigFilePath, wd)
+
+	taskConfigBytes, err := ioutil.ReadFile(taskConfigFilePath)
+
+	if err != nil {
+		fmt.Println("CommandProcessor", err)
 	}
 
-	scheduler.api.SendMessage(Message{
-		chatId: scheduler.api.ChatId(),
-		text:   "Build is ended",
-	})
+	var config map[string]string
+
+	err = json.Unmarshal(taskConfigBytes, &config)
+
+	if err != nil {
+		fmt.Println("CommandProcessor", err)
+	}
+
+	cp.taskScheduler.StartTask(config)
+
+}
+
+func (cp CommandProcessor) processFinishTask(tokens []string) {
+
+}
+
+func (cp CommandProcessor) exit() {
+
+}
+
+func NewCommandProcessor(taskScheduler TaskScheduler) CommandProcessor {
+	return CommandProcessor{
+		taskScheduler: taskScheduler,
+	}
 }
 
 func main() {
-	exampleLoginConfig := map[string]string{
-		"token":  "1119993912:AAGVQxcJZ-4zc2qpKqQn-Nwrlkk51Yys3UA",
-		"chatId": "-429622161",
+
+	path, err := os.Getwd()
+	if err != nil {
+		log.Println(err)
+	}
+	fmt.Println(path)
+
+	loginConfigPath := "D:\\Documents\\GoProjects\\task-sheduler\\config\\login.json"
+	loginConfigFile, err := os.Open(loginConfigPath)
+	defer loginConfigFile.Close()
+	if err != nil {
+		fmt.Println(err)
+	}
+	loginConfigBytes := make([]byte, 1024)
+	n, errRead := loginConfigFile.Read(loginConfigBytes)
+	fmt.Println(n)
+	if errRead != nil {
+		fmt.Println(errRead)
+	}
+	loginConfigBytes = loginConfigBytes[0:n]
+	fmt.Println("Bytes: ", loginConfigBytes)
+	var loginConfig LoginInfo
+
+	err = json.Unmarshal(loginConfigBytes, &loginConfig)
+	if err != nil {
+		fmt.Println(err)
 	}
 
-	exampleTaskConfig := map[string]string{
-		"type": "SomehtingElseJustForCheck",
+	fmt.Println(loginConfig)
+
+	exampleLoginConfig := map[string]string{
+		"token":  loginConfig.Token,
+		"chatId": loginConfig.ChatID,
 	}
 
 	taskScheduler := NewTaskScheduler(exampleLoginConfig)
 
-	taskScheduler.StartTask(exampleTaskConfig)
+	reader := bufio.NewReader(os.Stdin)
+	writer := bufio.NewWriter(os.Stdout)
+	commandProcessor := NewCommandProcessor(taskScheduler)
 
+	for {
+		buffer := make([]byte, 1024)
+		commandLineLength, err := reader.Read(buffer)
+		buffer = buffer[:commandLineLength]
+		if err != nil {
+			fmt.Println(err)
+			continue
+		}
+
+		commandProcessor.Process(buffer)
+		writer.Write([]byte("Command is being processed"))
+	}
 }
+
+// мама мыла раму конфидераты, мать их, задолбали уже всех американских матерей

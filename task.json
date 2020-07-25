@@ -1,0 +1,6 @@
+{
+    "type" : "ProcessEndedTask",
+    "pid" : "25936",
+    "pname" : "cmd.exe",
+    "message" : "cmd is closed" 
+}
