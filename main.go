@@ -9,7 +9,7 @@ import (
 
 func main() {
 
-	loginConfigPath := "config\\login.json"
+	loginConfigPath := "config/login.json"
 	loginConfigFile, err := os.Open(loginConfigPath)
 	defer loginConfigFile.Close()
 

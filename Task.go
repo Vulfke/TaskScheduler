@@ -65,8 +65,8 @@ func NewProcessEndedTask(config GeneralTaskConfig) ProcessEndedTask {
 
 func (t ProcessEndedTask) Done() bool {
 
-	windows := true
-	linux := false
+	windows := false
+	linux := true
 
 	if windows {
 
